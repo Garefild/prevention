@@ -1,0 +1,44 @@
+{
+    "compilerOptions": {
+        "strict": true,
+        "target": "ESNext",
+        "module": "ESNext",
+        "outDir": "dist",
+        "rootDir": ".",
+        "composite": false,
+        "declaration": true,
+        "skipLibCheck": true,
+        "esModuleInterop": true,
+        "isolatedModules": true,
+        "moduleDetection": "force",
+        "moduleResolution": "bundler",
+        "resolveJsonModule": true,
+        "emitDeclarationOnly": true,
+        "lib": [
+            "ESNext"
+        ],
+        "types": [
+            "node"
+        ],
+        "paths": {
+            "@services/*": [
+                "./src/services/*"
+            ],
+            "@interfaces/*": [
+                "./src/interfaces/*"
+            ]
+        }
+    },
+    "include": [
+        "src/index.ts",
+        "src/cli.ts"
+    ],
+    "exclude": [
+        "dist",
+        "node_modules",
+        "**/*.spec.ts"
+    ],
+    "references": [
+        { "path": "./tsconfig.spec.json" }
+    ]
+}

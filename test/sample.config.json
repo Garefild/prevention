@@ -1,0 +1,14 @@
+{
+    "logLevel": "info",
+    "ignore": [ "*.spec.js", "test/**" ],
+    "blacklist": [
+        { "pattern": [ "console.log", "console.error", "console.warn" ], "level": "warn" },
+        { "pattern": "/\\bdebugger\\b/", "level": "error", "message": "stray debugger statement" },
+        { "pattern": "TODO", "level": "info" }
+    ],
+    "checks": {
+        "comment": "error",
+        "minify": "error",
+        "parse": "error"
+    }
+}

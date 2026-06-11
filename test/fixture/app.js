@@ -1,0 +1,1 @@
+!function () {'use strict';function n(n, t) {return n + t;}let r = n(1, 2);console.log(r);for(let o = 0;o < 10;o++)console.log(o);let i = { a: 1, b: 2, c: 3 }, u = Object.keys(i).map(function (n) {return i[n] + 1;});console.log(u);let c = function (n) {return n.split('').reverse().join('');};console.log(c('hello world'));debugger;}();

@@ -1,0 +1,12 @@
+{
+    "ignore": [ "*.spec.js" ],
+    "blacklist": [
+        { "pattern": "console.log", "level": "off" },
+        { "pattern": "debugger", "level": "error" }
+    ],
+    "checks": {
+        "comment": "off",
+        "minify": "off",
+        "parse": "error"
+    }
+}
