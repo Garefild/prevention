@@ -94,6 +94,26 @@ test('validateSource passes minified output even with long single-line code', ()
     expect(validateSource(realMinified, 'app.js').filter((f) => f.kind === 'minify')).toEqual([]);
 });
 
+test('validateSource auto-detects code inside any call, even outside evalFunctions', () => {
+    const inner = '// embedded source\nfunction add(a, b) {\n    return a + b;\n}\nconst result = add(1, 2);\nconsole.log(result);\n';
+    const wrapped = '!function(){xterm.gray(`' + inner + '`);}();';
+    const findings = validateSource(wrapped, 'app.js');
+    expect(findings.some((f) => f.kind === 'comment' && f.label.includes('xterm.gray'))).toBe(true);
+    expect(findings.some((f) => f.kind === 'minify' && f.label.includes('xterm.gray'))).toBe(true);
+});
+
+test('validateSource does NOT recurse into plain multi-line text strings', () => {
+    const text = '"Line 1\\nLine 2\\nLine 3 with longer text and stuff"';
+    const findings = validateSource(`log(${ text });`, 'app.js');
+    expect(findings.some((f) => f.label.includes('log'))).toBe(false);
+});
+
+test('validateSource reads template literals with no interpolations', () => {
+    const wrapped = 'somelogger(`function x(longName) {\n    return longName + 1;\n}`);';
+    const findings = validateSource(wrapped, 'app.js');
+    expect(findings.some((f) => f.kind === 'minify' && f.label.includes('somelogger'))).toBe(true);
+});
+
 test('validateSource flags unminified multi-line code inside an eval-like call', () => {
     const config: ConfigInterface = {
         ...DEFAULT_CONFIG,

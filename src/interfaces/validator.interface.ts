@@ -92,12 +92,7 @@ export interface MinifyCheckResultInterface {
     identifiers?: IdentifierStatsInterface;
     signals: {
         text: boolean;
-        comments: boolean;
         identifiers: boolean;
-    };
-    comments?: {
-        count: number;
-        ratio: number;
     };
 }
 

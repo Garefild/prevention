@@ -2,8 +2,8 @@
  * Type-only imports erased during TypeScript compilation.
  */
 
-import type { Comment, Node } from 'acorn';
 import type { SimpleVisitors } from 'acorn-walk';
+import type { Comment, Node, Program } from 'acorn';
 import type { ConfigInterface } from '@interfaces/config.interface';
 import type { ValidationFindingInterface, IdentifierStatsInterface } from '@interfaces/validator.interface';
 
@@ -18,64 +18,98 @@ import { compileBlacklist, scanBlacklist } from '@services/blacklist.service';
 import { checkMinified, SHORT_NAME_MAX_LENGTH } from '@services/minify.service';
 
 /**
- * Internal result of one parse attempt against a single source string.
+ * One parse attempt against a single source string.
  *
  * @remarks
- * `ast` is `null` only when both the module-mode and script-mode parse
- * attempts threw. `comments` is always populated with whatever acorn
- * tokenized before the error position - this is what lets the validator
- * still report comments found inside an unparseable `eval(...)` string.
+ * `ast` is `null` only when both module-mode and script-mode parse
+ * attempts threw. `comments` is populated with everything tokenized
+ * before the failure position, so comments inside an unparseable
+ * snippet are still surfaced.
  *
  * @since 1.0.0
  */
 
 interface ParseResultInterface {
-    ast: Node | null;
-    comments: Comment[];
+    ast: Program | null;
+    comments: Array<Comment>;
     parseError: string | null;
 }
 
 /**
- * One string argument extracted from an `eval` or `Function` call site.
- *
- * @remarks
- * `source` is the literal string that will be re-parsed and re-validated.
- * `origin` and `line` are kept solely for labeling so the nested error
- * messages can be traced back to the call that introduced them.
+ * One nested source extracted from the parent AST and queued for re-validation.
  *
  * @since 1.0.0
  */
 
-interface EvalStringInterface {
+interface NestedSourceInterface {
     source: string;
     origin: string;
     line: number;
 }
 
 /**
- * Pattern matching the standard source-map pragma emitted by ministers.
- *
- * @remarks
- * Both `# sourceMappingURL=` and the legacy `@ sourceMappingURL=` forms
- * are recognized. Acorn strips the leading slashes ('//') before
- * the comment value is exposed.
+ * Statements whose presence in a string is strong evidence the string is JS code.
  *
  * @since 1.0.0
  */
 
-const SOURCEMAP_PRAGMA = /^[#@]\s*sourceMappingURL=/;
+const CODEY_STATEMENT_TYPES: ReadonlySet<string> = new Set([
+    'VariableDeclaration',
+    'FunctionDeclaration',
+    'ClassDeclaration',
+    'ImportDeclaration',
+    'ExportNamedDeclaration',
+    'ExportDefaultDeclaration',
+    'ExportAllDeclaration',
+    'IfStatement',
+    'ForStatement',
+    'ForInStatement',
+    'ForOfStatement',
+    'WhileStatement',
+    'DoWhileStatement',
+    'SwitchStatement',
+    'TryStatement',
+    'ReturnStatement',
+    'ThrowStatement',
+    'BreakStatement',
+    'ContinueStatement',
+    'LabeledStatement'
+]);
+
+/**
+ * Expression node types that, when wrapped in an ExpressionStatement, indicate code intent.
+ *
+ * @since 1.0.0
+ */
+
+const CODEY_EXPRESSION_TYPES: ReadonlySet<string> = new Set([
+    'CallExpression',
+    'NewExpression',
+    'AssignmentExpression',
+    'UpdateExpression',
+    'AwaitExpression',
+    'YieldExpression'
+]);
+
+/**
+ * Minimum length a string argument must reach before auto-detection treats it as a candidate.
+ *
+ * @since 1.0.0
+ */
+
+const MIN_AUTO_RECURSE_LENGTH = 20;
 
 /**
  * Parses one source string and returns the AST together with all comments.
  *
- * @param source - JavaScript or TypeScript-free JavaScript source to parse
- * @returns AST, collected comments, and parse-error message (if any)
+ * @param source - JavaScript source to parse
+ * @returns AST (when possible), collected comments, and a parse-error message
  *
  * @remarks
  * Tries `sourceType: 'module'` first and falls back to `'script'` on
- * failure. Comments are accumulated via the `onComment` callback so that
- * even a final parse failure still surfaces every comment seen up to the
- * error position. The hashbang line is supported via `allowHashBang`.
+ * failure. The hashbang line is permitted. Comments are accumulated via
+ * the `onComment` callback so even a fatal parse error still surfaces
+ * comments seen up to the error position.
  *
  * @since 1.0.0
  */
@@ -88,16 +122,11 @@ function parseSource(source: string): ParseResultInterface {
         onComment: comments,
         locations: true
     };
-
     try {
-        const ast = acorn.parse(source, { ...opts, sourceType: 'module' });
-
-        return { ast, comments, parseError: null };
+        return { ast: acorn.parse(source, { ...opts, sourceType: 'module' }), comments, parseError: null };
     } catch {
         try {
-            const ast = acorn.parse(source, { ...opts, sourceType: 'script' });
-
-            return { ast, comments, parseError: null };
+            return { ast: acorn.parse(source, { ...opts, sourceType: 'script' }), comments, parseError: null };
         } catch (e) {
             return { ast: null, comments, parseError: (<Error> e).message };
         }
@@ -107,126 +136,135 @@ function parseSource(source: string): ParseResultInterface {
 /**
  * Decides whether a comment should be ignored as tooling metadata.
  *
- * @param c - The comment node reported by acorn
- * @param source - Full source string the comment was parsed from
+ * @param c - Comment node from acorn
+ * @param source - Full source the comment came from
  * @returns true - if the comment is a shebang or source-map pragma
  *
  * @remarks
- * Two specific comment shapes are treated as non-editorial and skipped:
- * 1. A line comment at offset 0 in a file that starts with `#!` - the
- *    shebang line that node, env, deno, etc. require on executable
- *    scripts. esbuild and acorn both expose it through the comment API.
- * 2. A line comment whose value matches {@link SOURCEMAP_PRAGMA} - the
- *    `//# sourceMappingURL=...` pragma that minifiers append so a source
- *    map can be located at runtime.
- *
- * All other comments - including license banners - are reported.
+ * - A line comment at offset 0 in a file starting with `#!` is the
+ *   shebang interpreter directive.
+ * - A line comment whose body (after leading whitespace) starts with
+ *   `# sourceMappingURL=` or `@ sourceMappingURL=` is the standard
+ *   source-map pragma emitted by minifiers.
  *
  * @since 1.0.0
  */
 
 function isIgnoredComment(c: Comment, source: string): boolean {
     if (c.start === 0 && c.type === 'Line' && source.startsWith('#!')) return true;
+    if (c.type !== 'Line') return false;
+    const v = c.value.trimStart();
 
-    return c.type === 'Line' && SOURCEMAP_PRAGMA.test(c.value);
+    return v.startsWith('# sourceMappingURL=') || v.startsWith('@ sourceMappingURL=');
 }
 
 /**
- * Walks an AST and collects every string argument passed to `eval` or `new Function`.
+ * Resolves the dotted name of a Call/New callee.
  *
- * @param ast - Root of the parsed program
- * @returns Each extracted string with its origin tag and source line
- *
- * @remarks
- * Recognised call shapes:
- * - `eval("...")` - the first argument is treated as the body
- * - `new Function("a", "b", "...")` - only the **last** argument is the body,
- *   the preceding string arguments are parameter names
- *
- * Only literal string arguments are picked up; runtime-constructed
- * expressions (template literals with interpolations, identifiers,
- * concatenations) are deliberately ignored - they cannot be analysed
- * statically and are out of scope for this validator.
- *
- * @since 1.0.0
- */
-
-/**
- * Resolves the dotted name of a call/new callee, or `null` for non-identifier shapes.
- *
- * @param node - The `callee` expression of a CallExpression or NewExpression
- * @returns A dotted name like `"eval"` or `"vm.runInThisContext"`, or `null`
- *
- * @remarks
- * Walks the spine of a `MemberExpression` chain, joining each non-computed
- * property identifier with a `.`. Computed access (`obj["foo"]`) and
- * function-call results in the spine are not resolvable and produce
- * `null`. This is the lookup key against `config.evalFunctions`.
+ * @param node - The `callee` field of a CallExpression or NewExpression
+ * @returns A dotted name like `"vm.runInThisContext"`, or `null` for non-identifier shapes
  *
  * @since 1.0.0
  */
 
 function resolveCalleeName(node: unknown): string | null {
-    const n = node as { type: string } & Record<string, unknown>;
-    if (n.type === 'Identifier') return n.name as string;
-    if (n.type === 'MemberExpression' && !n.computed) {
-        const prop = n.property as { type: string; name?: string };
-        if (prop.type !== 'Identifier' || !prop.name) return null;
-        const objName = resolveCalleeName(n.object);
-        if (objName === null) return null;
+    const n = node as { type: string; name?: string; computed?: boolean; property?: { type: string; name?: string }; object?: unknown };
+    if (n.type === 'Identifier' && n.name) return n.name;
+    if (n.type === 'MemberExpression' && !n.computed && n.property) {
+        if (n.property.type !== 'Identifier' || !n.property.name) return null;
+        const obj = resolveCalleeName(n.object);
+        if (obj === null) return null;
 
-        return `${ objName }.${ prop.name }`;
+        return `${ obj }.${ n.property.name }`;
     }
 
     return null;
 }
 
 /**
- * Walks an AST and collects every string argument passed to a configured eval-like function.
+ * Extracts the string value of an argument that is a string-literal-shaped expression.
  *
- * @param ast - Root of the parsed program
- * @param evalFunctionNames - Set of dotted callee names that consume JS-as-string
- * @returns Each extracted string with its origin tag and source line
+ * @param node - One argument from a CallExpression / NewExpression
+ * @returns The string contents, or `null` for non-string-literal shapes
  *
  * @remarks
- * Both `CallExpression` and `NewExpression` are inspected. The callee is
- * resolved via {@link resolveCalleeName}; if the resulting name is in
- * `evalFunctionNames`, every string-literal argument is yielded. Scanning
- * all string args (rather than a fixed positional index) is intentional:
- * it lets a single config entry like `'Function'` cover the body argument
- * without the user specifying `argIndex`, and parameter-name args
- * (`'a'`, `'b'`) are small enough that they pass the minify and comment
- * checks trivially.
+ * Two AST shapes return a value:
+ * - `Literal` whose `value` is a string (covers both `'...'` and `"..."`).
+ * - `TemplateLiteral` with **no** `${...}` interpolations - i.e. a
+ *   single `TemplateElement` quasi and an empty `expressions` array.
  *
- * The origin tag prepends `new ` for `NewExpression` so the resulting
- * label distinguishes `Function("body")` from `new Function("body")` in
- * the output.
- *
- * Non-literal arguments (template literals with interpolation, runtime
- * concatenations, identifiers) are skipped - they cannot be analysed
- * statically.
+ * Template literals with interpolations and runtime concatenations are
+ * skipped: their final value isn't known until runtime so they cannot
+ * be analysed statically.
  *
  * @since 1.0.0
  */
+
+function readStringArg(node: unknown): string | null {
+    const n = node as { type: string; value?: unknown; expressions?: ReadonlyArray<unknown>; quasis?: ReadonlyArray<{ value: { cooked?: string; raw: string } }> };
+    if (n.type === 'Literal' && typeof n.value === 'string') return n.value;
+    if (n.type === 'TemplateLiteral' && n.expressions?.length === 0 && n.quasis?.length === 1) {
+        return n.quasis[0].value.cooked ?? n.quasis[0].value.raw;
+    }
+
+    return null;
+}
+
+/**
+ * Returns true when a top-level AST statement is something a code author writes.
+ *
+ * @param stmt - One element of `Program.body`
+ * @returns true - if the statement type suggests real code rather than data
+ *
+ * @remarks
+ * Used by {@link isLikelyCode} to distinguish a multi-line text string
+ * (whose body parses as a sequence of bare `Identifier` references) from
+ * an actual JS source string (which has declarations, control flow, or
+ * meaningful expression statements like calls and assignments).
+ *
+ * @since 1.0.0
+ */
+
+function isCodeyStatement(stmt: unknown): boolean {
+    const s = stmt as { type: string; expression?: { type: string } };
+    if (CODEY_STATEMENT_TYPES.has(s.type)) return true;
+    if (s.type === 'ExpressionStatement' && s.expression) {
+        return CODEY_EXPRESSION_TYPES.has(s.expression.type);
+    }
+
+    return false;
+}
+
+/**
+ * Decides whether a string passed as a function argument is itself JavaScript source code.
+ *
+ * @param s - The candidate string value
+ * @returns true - if `s` parses as JS and contains real code constructs
+ *
+ * @remarks
+ * Cheap pre-filters reject strings that are too short or single-line, so
+ * the parse attempt only runs on plausible candidates. The verdict comes
+ * from the AST: at least one top-level statement must be "codey" - a
+ * declaration, control-flow construct, or call/assignment expression.
+ * Plain text like `"Line 1\nLine 2"` parses as identifier references
+ * and is correctly rejected.
+ *
+ * @since 1.0.0
+ */
+
+function isLikelyCode(s: string): boolean {
+    if (s.length < MIN_AUTO_RECURSE_LENGTH || !s.includes('\n')) return false;
+    const parsed = parseSource(s);
+    if (!parsed.ast) return false;
+
+    return parsed.ast.body.some(isCodeyStatement);
+}
 
 /**
  * Walks an AST and summarises the lengths of all local-declaration identifier names.
  *
  * @param ast - Root of the parsed program
- * @returns Aggregated counts and ratios, or `null` when the file has no captured declarations
- *
- * @remarks
- * Captured shapes:
- * - `VariableDeclarator.id` when the id is an `Identifier` (destructuring patterns skipped)
- * - `FunctionDeclaration.id` and its `Identifier` parameters
- * - `FunctionExpression.id` and its `Identifier` parameters
- * - `ArrowFunctionExpression` `Identifier` parameters
- * - `ClassDeclaration.id`
- *
- * Import specifiers, member expressions, and property accesses are
- * deliberately excluded: their names are dictated by external interfaces
- * (the imported module's exports, the consumed object's shape) and are
- * not renamed by minifiers in the same way local declarations are.
+ * @returns Aggregated counts, or `null` when nothing was captured
  *
  * @since 1.0.0
  */
@@ -275,14 +313,39 @@ function analyzeIdentifiers(ast: Node): IdentifierStatsInterface | null {
     };
 }
 
-function collectEvalStrings(ast: Node, evalFunctionNames: Set<string>): EvalStringInterface[] {
-    const strings: Array<EvalStringInterface> = [];
+/**
+ * Walks an AST and extracts every string-literal arg that should be re-validated.
+ *
+ * @param ast - Root of the parsed program
+ * @param forced - Set of dotted callee names whose string args are always extracted
+ * @returns Each extracted string with an origin tag and source line
+ *
+ * @remarks
+ * Both `CallExpression` and `NewExpression` are inspected. For every
+ * string-literal-shaped argument (see {@link readStringArg}) the
+ * function emits a nested source when **either**:
+ *
+ * - The callee's resolved name (from {@link resolveCalleeName}) is in
+ *   `forced` - matches the user's `config.evalFunctions` list. This
+ *   path catches short eval bodies like `eval("a+b")` that wouldn't
+ *   trip auto-detection.
+ * - {@link isLikelyCode} returns true - the string is long enough,
+ *   multi-line, and parses as JS with at least one real statement.
+ *   This path catches template-literal smuggling like a logger
+ *   receiving a backtick-quoted JS source dump, without configuration.
+ *
+ * @since 1.0.0
+ */
 
-    function pushStringArgs(args: ReadonlyArray<unknown>, origin: string, line: number): void {
+function extractNestedSources(ast: Node, forced: ReadonlySet<string>): Array<NestedSourceInterface> {
+    const out: Array<NestedSourceInterface> = [];
+
+    function consider(args: ReadonlyArray<unknown>, origin: string, line: number, forceAll: boolean): void {
         for (const arg of args) {
-            const a = arg as { type: string; value?: unknown };
-            if (a.type === 'Literal' && typeof a.value === 'string') {
-                strings.push({ source: a.value, origin, line });
+            const s = readStringArg(arg);
+            if (s === null) continue;
+            if (forceAll || isLikelyCode(s)) {
+                out.push({ source: s, origin, line });
             }
         }
     }
@@ -290,61 +353,48 @@ function collectEvalStrings(ast: Node, evalFunctionNames: Set<string>): EvalStri
     const visitors: SimpleVisitors<unknown> = {
         CallExpression(node) {
             const name = resolveCalleeName(node.callee);
-            if (name === null || !evalFunctionNames.has(name)) return;
-            pushStringArgs(node.arguments, name, node.loc?.start.line ?? 0);
+            const force = name !== null && forced.has(name);
+            consider(node.arguments, name ?? '<call>', node.loc?.start.line ?? 0, force);
         },
         NewExpression(node) {
             const name = resolveCalleeName(node.callee);
-            if (name === null || !evalFunctionNames.has(name)) return;
-            pushStringArgs(node.arguments, `new ${ name }`, node.loc?.start.line ?? 0);
+            const force = name !== null && forced.has(name);
+            consider(node.arguments, name ? `new ${ name }` : '<new>', node.loc?.start.line ?? 0, force);
         }
     };
 
     walk.simple(ast, visitors);
 
-    return strings;
+    return out;
 }
 
 /**
  * Validates a single JavaScript source string against the active configuration.
  *
  * @param source - Source code to validate
- * @param label - Human-readable identifier reported back on every finding (typically the file path)
- * @param config - Resolved configuration; defaults to {@link DEFAULT_CONFIG} when omitted
- * @returns Zero or more findings; an empty array means the source is clean
+ * @param label - Identifier reported on every finding (typically the file path)
+ * @param config - Resolved configuration; defaults to {@link DEFAULT_CONFIG}
+ * @returns Zero or more findings; empty means the source is clean
  *
  * @remarks
- * Four independent checks are performed and their findings concatenated:
+ * Four independent checks run and their findings are concatenated:
  *
- * 1. **Comments** - every `//` and `/* *\/` block produced by acorn is
- *    reported, except those filtered by {@link isIgnoredComment}.
- *    Severity comes from `config.checks.comment`.
- * 2. **Minification** - {@link checkMinified} flags pretty-printed input.
- *    Severity comes from `config.checks.minify`.
- * 3. **Blacklist** - every configured pattern is matched against the
- *    raw source. Severity comes from the entry's own `level` field.
- * 4. **`eval` / `new Function`** - the AST is walked for literal-string
- *    arguments to these constructs, and each is recursively re-validated
- *    using the same config. Nested findings are labeled
- *    `<parent> → eval@<line>` so the source site can be located.
+ * 1. **Comments** - every `//` and `/* *\/` block from acorn, minus the
+ *    shebang and source-map pragmas filtered by {@link isIgnoredComment}.
+ * 2. **Minification** - {@link checkMinified} called with the AST-derived
+ *    identifier stats from {@link analyzeIdentifiers}.
+ * 3. **Blacklist** - configured patterns scanned against the raw source
+ *    via {@link scanBlacklist}.
+ * 4. **Nested sources** - {@link extractNestedSources} collects every
+ *    string-literal-shaped argument to a CallExpression/NewExpression
+ *    that either matches `config.evalFunctions` or auto-detects as code,
+ *    and each one is recursively validated with the same config. The
+ *    finding label becomes `<parent> → <callee>@<line>`.
  *
- * If the parser fails outright, a single finding of the kind ` parse ` is added
- * (severity from `config.checks.parse`), but any comments tokenized
- * before the error position are still reported - this is what makes
- * detection inside an unparseable `eval(...)` body possible.
+ * A parse failure produces a single `parse`-kind finding (unless that
+ * check is `off`) but comments tokenized before the failure point are
+ * still reported.
  *
- * @example
- * ```ts
- * validateSource('console.log(1)', 'app.js', {
- *     ...DEFAULT_CONFIG,
- *     blacklist: [{ pattern: 'console.log', level: 'warn' }]
- * });
- * // [{ label: 'app.js', kind: 'blacklist', severity: 'warn', message: '...' }]
- * ```
- *
- * @see validateFolder
- * @see checkMinified
- * @see scanBlacklist
  * @since 1.0.0
  */
 
@@ -377,9 +427,6 @@ export function validateSource(source: string, label: string, config: ConfigInte
             if (minify.signals.text) {
                 parts.push(`whitespace=${ (minify.whitespaceRatio * 100).toFixed(1) }%, avgLineLen=${ minify.avgLineLength.toFixed(0) }`);
             }
-            if(minify.signals.comments && minify.comments) {
-                parts.push(`comments count=${ minify.comments.count }, ratio=${ (minify.comments.ratio * 100).toFixed(1) }%`);
-            }
             findings.push({
                 label,
                 kind: 'minify',
@@ -390,17 +437,13 @@ export function validateSource(source: string, label: string, config: ConfigInte
     }
 
     if (config.blacklist.length) {
-        const compiled = compileBlacklist(config.blacklist);
-        findings.push(...scanBlacklist(source, label, compiled));
+        findings.push(...scanBlacklist(source, label, compileBlacklist(config.blacklist)));
     }
 
     if (parsed.ast) {
-        if (config.evalFunctions.length > 0) {
-            const evalNames = new Set(config.evalFunctions);
-            for (const inner of collectEvalStrings(parsed.ast, evalNames)) {
-                const sub = validateSource(inner.source, `${ label } → ${ inner.origin }@${ inner.line }`, config);
-                findings.push(...sub);
-            }
+        const forced = new Set(config.evalFunctions);
+        for (const nested of extractNestedSources(parsed.ast, forced)) {
+            findings.push(...validateSource(nested.source, `${ label } → ${ nested.origin }@${ nested.line }`, config));
         }
     } else if (parsed.parseError && config.checks.parse !== 'off') {
         findings.push({

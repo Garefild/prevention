@@ -8,22 +8,26 @@ import type { MinifyCheckResultInterface, IdentifierStatsInterface } from '@inte
  * Minimum file size in bytes before the text-based minification heuristic activates.
  *
  * @remarks
- * Very small files cannot be reliably classified - a four-line config or a
- * single export statement will fail any whitespace-ratio test even when it
- * is the canonical shipped form. Below this threshold {@link checkMinified}
- * returns `minified: true` unconditionally, unless the source has an
- * internal newline (see {@link checkMinified}).
+ * Files below this size that are also single-line are auto-passed because
+ * they cannot be reliably classified. A multi-line source skips this
+ * short-circuit because a real minified file never has a literal `\n`
+ * between statements.
  *
  * @since 1.0.0
  */
 
 const MIN_SIZE_FOR_MINIFY_CHECK = 256;
 
-const MIN_COMMENT_COUNT_FOR_UNMINIFIED = 3;
-const MIN_COMMENT_RATIO_FOR_UNMINIFIED = 0.05;
+/**
+ * Whitespace-ratio ceiling above which the text signal fires.
+ *
+ * @since 1.0.0
+ */
+
+const MAX_WHITESPACE_RATIO_MINIFIED = 0.2;
 
 /**
- * Upper bound on the average line length of an "unminified" file.
+ * Average non-empty line length below which the text signal fires.
  *
  * @since 1.0.0
  */
@@ -31,21 +35,7 @@ const MIN_COMMENT_RATIO_FOR_UNMINIFIED = 0.05;
 const MAX_AVG_LINE_LENGTH_UNMINIFIED = 200;
 
 /**
- * Upper bound on the whitespace ratio of a "minified" file.
- *
- * @since 1.0.0
- */
-
-const MAX_WHITESPACE_RATIO_MINIFIED = 0.20;
-
-/**
- * Minimum number of local declarations needed before the identifier signal is trusted.
- *
- * @remarks
- * Files with fewer declarations than this fall back to the text heuristic.
- * A handful of names is too small a sample to read mean-length reliably,
- * and a file with zero declarations (e.g. a one-line `console.log` call)
- * has nothing to measure at all.
+ * Minimum number of local declarations needed before the identifier signal is consulted.
  *
  * @since 1.0.0
  */
@@ -55,39 +45,80 @@ const ID_CONFIDENCE_COUNT = 5;
 /**
  * Maximum identifier length still considered "short" for the minified signal.
  *
- * @remarks
- * Terser, esbuild, swc, and webpack all rename locals to 1-2 character
- * names by default (`a`, `e`, `n`, `t0`, etc.). Hand-written code rarely
- * uses names this short outside of loop counters.
- *
  * @since 1.0.0
  */
 
 export const SHORT_NAME_MAX_LENGTH = 2;
 
 /**
- * Minimum fraction of declarations that must be "short" for a file to count as minified.
- *
- * @remarks
- * In real-world minified output 70-95% of local declarations are 1-2 chars.
- * Hand-written code typically has under 20%. Half is a comfortable middle
- * that handles mixed files (large blocks of inlined external code + a few
- * minified wrappers, or vice versa) without flip-flopping.
+ * Minimum fraction of declarations that must be short before the identifier signal calls a file minified.
  *
  * @since 1.0.0
  */
 
 const MIN_SHORT_NAME_RATIO_FOR_MINIFIED = 0.5;
 
-function analyzeComments(source: string): { count: number; ratio: number } {
-    const lineComments = source.match(/\/\/[^\n]*/g) || [];
-    const blockComments = source.match(/\/\*[\s\S]*?\*\//g) || [];
-    const count = lineComments.length + blockComments.length;
-    const commentChars = lineComments.reduce((sum, c) => sum + c.length, 0) +
-        blockComments.reduce((sum, c) => sum + c.length, 0);
-    const ratio = commentChars / source.length;
+/**
+ * Returns true when the character code is ASCII whitespace.
+ *
+ * @param code - UTF-16 code unit
+ * @returns true - for SP, TAB, LF, CR, FF, or VT
+ *
+ * @remarks
+ * Hand-rolled to avoid a per-character regex match. Covers the same set
+ * as the JavaScript `/\s/` character class for the ASCII range, which is
+ * enough for source code: non-ASCII whitespace in JS source is
+ * essentially never seen outside of string literals.
+ *
+ * @since 1.0.0
+ */
 
-    return { count, ratio };
+function isWhitespaceCode(code: number): boolean {
+    return code === 0x20 || code === 0x09 || code === 0x0A || code === 0x0D || code === 0x0C || code === 0x0B;
+}
+
+/**
+ * Computes whitespace ratio and average non-empty line length in a single pass.
+ *
+ * @param source - Source text to scan
+ * @returns Both metrics, ready for threshold comparison
+ *
+ * @since 1.0.0
+ */
+
+function scanTextMetrics(source: string): { whitespaceRatio: number; avgLineLength: number } {
+    let whitespace = 0;
+    let nonEmptyLineCount = 0;
+    let nonEmptyLineChars = 0;
+    let currentLineLength = 0;
+    let currentLineHasContent = false;
+
+    for (let i = 0; i < source.length; i++) {
+        const c = source.charCodeAt(i);
+        const isWs = isWhitespaceCode(c);
+        if (isWs) whitespace++;
+
+        if (c === 0x0A) {
+            if (currentLineHasContent) {
+                nonEmptyLineChars += currentLineLength;
+                nonEmptyLineCount++;
+            }
+            currentLineLength = 0;
+            currentLineHasContent = false;
+        } else {
+            currentLineLength++;
+            if (!isWs) currentLineHasContent = true;
+        }
+    }
+    if (currentLineHasContent) {
+        nonEmptyLineChars += currentLineLength;
+        nonEmptyLineCount++;
+    }
+
+    return {
+        whitespaceRatio: source.length ? whitespace / source.length : 0,
+        avgLineLength: nonEmptyLineCount ? nonEmptyLineChars / nonEmptyLineCount : 0
+    };
 }
 
 /**
@@ -95,87 +126,57 @@ function analyzeComments(source: string): { count: number; ratio: number } {
  *
  * @param source - Full file contents to analyze
  * @param identifiers - Optional identifier statistics extracted from the parsed AST
- * @returns The verdict together with the underlying measurements
+ * @returns The verdict together with which signals fired
  *
  * @remarks
- * The decision uses the strongest signal available, in this order:
+ * Two independent signals are computed and combined with `OR` - either
+ * one alone is enough to flag a file as not minified, and both must
+ * agree for a file to pass.
  *
- * 1. **Identifier statistics** (when the AST is available and the file has
- *    at least {@link ID_CONFIDENCE_COUNT} local declarations). A file is
- *    minified iff at least {@link MIN_SHORT_NAME_RATIO_FOR_MINIFIED} of
- *    its declaration names are {@link SHORT_NAME_MAX_LENGTH} chars or
- *    shorter. This is the most reliable signal because minifiers rename
- *    locals to 1-2 chars and pretty-printed code almost never does.
+ * 1. **Identifier signal** (only when the AST yielded at least
+ *    {@link ID_CONFIDENCE_COUNT} local declarations). Fires when fewer
+ *    than {@link MIN_SHORT_NAME_RATIO_FOR_MINIFIED} of those names are
+ *    {@link SHORT_NAME_MAX_LENGTH} chars or shorter. Catches long
+ *    single-line code that the text signal alone would miss because of
+ *    its low whitespace ratio.
  *
- * 2. **Text heuristic** (fallback). Combines whitespace ratio and average
- *    line length. A file is flagged only when **both** signals indicate
- *    pretty-printing: ratio above {@link MAX_WHITESPACE_RATIO_MINIFIED}
- *    **and** average line length below {@link MAX_AVG_LINE_LENGTH_UNMINIFIED}.
- *    Requiring both prevents false positives on minified output that
- *    wraps at column 80, on heavily-templated files, and on files with
- *    inline binary blobs.
+ * 2. **Text signal** (only when the source is at least
+ *    {@link MIN_SIZE_FOR_MINIFY_CHECK} bytes **or** contains an internal
+ *    newline). Fires when whitespace ratio is above
+ *    {@link MAX_WHITESPACE_RATIO_MINIFIED} **and** the average non-empty
+ *    line is below {@link MAX_AVG_LINE_LENGTH_UNMINIFIED}. Catches
+ *    multi-line pretty-printed code regardless of identifier choices.
  *
- *    A 256-byte size short-circuit applies, but only to **single-line**
- *    input. Any source with an internal newline still runs the
- *    heuristic, because a real minified file never has a literal `\n`
- *    between statements.
- *
- * @example
- * ```ts
- * checkMinified('!function(){"use strict";...}();', undefined);
- * // text path - long single line passes
- *
- * checkMinified(source, { count: 42, meanLength: 1.2, shortRatio: 0.95 });
- * // identifier path - 95% short names → minified
- *
- * checkMinified(source, { count: 42, meanLength: 7.4, shortRatio: 0.05 });
- * // identifier path - 5% short names → not minified
- * ```
+ * Tiny single-line sources skip the text signal entirely (they can't be
+ * reliably classified). If no identifier stats were supplied either,
+ * the result is `minified: true` with both signals false.
  *
  * @since 1.0.0
  */
 
 export function checkMinified(source: string, identifiers?: IdentifierStatsInterface): MinifyCheckResultInterface {
-    const idSaysNotMinified =
-        identifiers !== undefined &&
-        identifiers.count >= ID_CONFIDENCE_COUNT &&
-        identifiers.shortRatio < MIN_SHORT_NAME_RATIO_FOR_MINIFIED;
-
-    const comment = analyzeComments(source);
-    const commentSaysNotMinified = comment.count >= MIN_COMMENT_COUNT_FOR_UNMINIFIED && comment.ratio >= MIN_COMMENT_RATIO_FOR_UNMINIFIED;
+    const idSignal = identifiers !== undefined
+        && identifiers.count >= ID_CONFIDENCE_COUNT
+        && identifiers.shortRatio < MIN_SHORT_NAME_RATIO_FOR_MINIFIED;
 
     let whitespaceRatio = 0;
     let avgLineLength = 0;
-    let textSaysNotMinified = false;
+    let textSignal = false;
 
     const hasInternalNewline = source.trim().includes('\n');
     if (source.length >= MIN_SIZE_FOR_MINIFY_CHECK || hasInternalNewline) {
-        const stripped = source.replace(/\s/g, '');
-        whitespaceRatio = (source.length - stripped.length) / source.length;
-        const lines = source.split('\n').filter((l) => l.trim().length > 0);
-        avgLineLength = lines.length
-            ? lines.reduce((a, l) => a + l.length, 0) / lines.length
-            : 0;
-        textSaysNotMinified =
-            whitespaceRatio > MAX_WHITESPACE_RATIO_MINIFIED &&
-            avgLineLength < MAX_AVG_LINE_LENGTH_UNMINIFIED;
+        const metrics = scanTextMetrics(source);
+        whitespaceRatio = metrics.whitespaceRatio;
+        avgLineLength = metrics.avgLineLength;
+        textSignal = whitespaceRatio > MAX_WHITESPACE_RATIO_MINIFIED
+            && avgLineLength < MAX_AVG_LINE_LENGTH_UNMINIFIED;
     }
 
-    const minified = !(commentSaysNotMinified || idSaysNotMinified || textSaysNotMinified);
-
     return {
-        minified,
+        minified: !(idSignal || textSignal),
         whitespaceRatio,
         avgLineLength,
         identifiers,
-        signals: {
-            text: textSaysNotMinified,
-            comments: commentSaysNotMinified,
-            identifiers: idSaysNotMinified
-        },
-        comments: {
-            count: comment.count,
-            ratio: comment.ratio
-        }
+        signals: { text: textSignal, identifiers: idSignal }
     };
 }
